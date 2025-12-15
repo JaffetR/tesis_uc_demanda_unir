@@ -1,0 +1,25 @@
+# Entornos
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# DB real (pero permitimos db/.gitkeep)
+db/*.db
+db/*.sqlite
+db/*.sqlite3
+db/tesis_uc.db
+!db/.gitkeep
+
+# Bloquear datos dentro de raw/out pero permitir .gitkeep
+data/raw/*
+!data/raw/.gitkeep
+
+data/out/*
+!data/out/.gitkeep
+
+# Modelos entrenados (no subir)
+data/models/*
+!data/models/.gitkeep
+*.joblib
