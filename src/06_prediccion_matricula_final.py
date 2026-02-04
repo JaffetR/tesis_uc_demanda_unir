@@ -3,6 +3,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# ==========================
+# CONFIG PRINCIPAL
+# ==========================
+MODEL_TAG = "xgb"  # "rf" o "xgb"
+
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_DIR / "db" / "tesis_uc.db"
 OUT_DIR = PROJECT_DIR / "data" / "out"
@@ -20,9 +25,12 @@ FACTOR_ASISTENCIA = 0.92
 A_PRIOR = 2.0
 B_PRIOR = 2.0
 
-# Tabla base generada por 02c
-TABLA_BASE = f"demanda_simulada_rf_{PERIODO_OBJ}"
-TABLA_OUT = f"matricula_esperada_{PERIODO_OBJ}"
+# ==========================
+# TABLAS / SALIDAS (por modelo)
+# ==========================
+TABLA_BASE = f"demanda_simulada_{MODEL_TAG}_{PERIODO_OBJ}"
+TABLA_OUT = f"matricula_esperada_{MODEL_TAG}_{PERIODO_OBJ}"
+OUT_CSV = OUT_DIR / f"matricula_esperada_{MODEL_TAG}_{PERIODO_OBJ}.csv"
 
 
 def beta_posterior_mean(k, n, a=A_PRIOR, b=B_PRIOR):
@@ -30,6 +38,7 @@ def beta_posterior_mean(k, n, a=A_PRIOR, b=B_PRIOR):
 
 
 def load_demanda_base(conn):
+    # Lee la tabla generada por el 05 (según rf/xgb)
     df = pd.read_sql_query(f"SELECT * FROM {TABLA_BASE}", conn)
     df["curso_id"] = df["curso_id"].astype(str).str.strip()
     df["CAMPUS"] = df["CAMPUS"].astype(str).str.strip()
@@ -126,7 +135,6 @@ def calc_desaprob_rates(conn):
 
 
 def calc_cap_hist_externo(conn):
-    # Cap histórico por curso/campus/modalidad usando MATRICULADOS_CON_RETIRADOS en secciones ACTIVAS
     df = pd.read_sql_query(
         """
         SELECT
@@ -157,18 +165,16 @@ def calc_cap_hist_externo(conn):
 
     df["m_con"] = pd.to_numeric(df["m_con"], errors="coerce").fillna(0.0)
 
-    # sumar por periodo primero (cap de matrícula inicial por periodo)
     per = df.groupby(["curso_id", "CAMPUS", "MODALIDAD", "PERIODO"], as_index=False).agg(
         m_con_periodo=("m_con", "sum")
     )
 
-    # cap histórico (p90 y max)
     g = per.groupby(["curso_id", "CAMPUS", "MODALIDAD"], as_index=False).agg(
         cap_p90=("m_con_periodo", lambda s: float(np.percentile(s.values, 90)) if len(s) else 0.0),
         cap_max=("m_con_periodo", "max"),
         n_periodos=("m_con_periodo", "size")
     )
-    # redondeo para que sea “estudiantes”
+
     g["cap_p90"] = g["cap_p90"].round().astype(int)
     g["cap_max"] = pd.to_numeric(g["cap_max"], errors="coerce").fillna(0).round().astype(int)
     g["n_periodos"] = pd.to_numeric(g["n_periodos"], errors="coerce").fillna(0).astype(int)
@@ -180,25 +186,29 @@ def main():
     conn = sqlite3.connect(DB_PATH)
 
     cursos_externo = load_cursos_externo()
-    print(f"Cursos externo cargados: {len(cursos_externo)}")
+    print(f"[{MODEL_TAG}] Cursos externo cargados: {len(cursos_externo)}")
 
+    # 1) Base de demanda simulada (salida del 05)
     base = load_demanda_base(conn)
+
+    # 2) Tasas históricas
     retiro = calc_retiro_rates(conn)
     desap = calc_desaprob_rates(conn)
     cap_hist = calc_cap_hist_externo(conn)
 
+    # 3) Merge
     df = base.merge(retiro, on=["curso_id", "CAMPUS", "MODALIDAD"], how="left")
     df = df.merge(desap, on=["curso_id", "CAMPUS", "MODALIDAD"], how="left")
     df = df.merge(cap_hist, on=["curso_id", "CAMPUS", "MODALIDAD"], how="left")
 
-    # fallbacks si no hay histórico
+    # 4) fallbacks
     df["tasa_retiro"] = df["tasa_retiro"].fillna(0.05)
     df["tasa_desaprob"] = df["tasa_desaprob"].fillna(0.15)
     df["cap_p90"] = df["cap_p90"].fillna(0).astype(int)
     df["cap_max"] = df["cap_max"].fillna(0).astype(int)
     df["n_periodos"] = df["n_periodos"].fillna(0).astype(int)
 
-    # Repetidores esperados (unión de eventos)
+    # 5) Repetidores esperados
     df["p_repeat"] = (1.0 - (1.0 - df["tasa_retiro"]) * (1.0 - df["tasa_desaprob"])).clip(0, 0.60)
 
     df["demanda_base"] = pd.to_numeric(df["demanda_mean"], errors="coerce").fillna(0).astype(int)
@@ -213,10 +223,8 @@ def main():
     df["matricula_p10_raw"] = ((d10 * FACTOR_ASISTENCIA) + (d10 * df["p_repeat"])).round().astype(int)
     df["matricula_p90_raw"] = ((d90 * FACTOR_ASISTENCIA) + (d90 * df["p_repeat"])).round().astype(int)
 
-    # Aplicar cap externo (solo a los cursos listados)
+    # Cap externo
     df["es_externo"] = df["curso_id"].isin(cursos_externo).astype(int)
-
-    # Si no hay cap histórico (0), no capamos (para no romper)
     df["cap_hist_usado"] = np.where(df["cap_p90"] > 0, df["cap_p90"], df["cap_max"]).astype(int)
 
     df["matricula_esperada"] = np.where(
@@ -237,7 +245,6 @@ def main():
         df["matricula_p90_raw"]
     ).astype(int)
 
-    # columnas finales
     out = df[[
         "PERIODO", "curso_id", "CAMPUS", "MODALIDAD",
         "demanda_base",
@@ -250,14 +257,13 @@ def main():
         "K_SIM", "periodo_base"
     ]].copy()
 
-    out_csv = OUT_DIR / f"matricula_esperada_{PERIODO_OBJ}.csv"
-    out.to_csv(out_csv, index=False, encoding="utf-8")
-    print(f"CSV generado: {out_csv}")
+    out.to_csv(OUT_CSV, index=False, encoding="utf-8")
+    print(f"[{MODEL_TAG}] CSV generado: {OUT_CSV}")
 
     out.to_sql(TABLA_OUT, conn, if_exists="replace", index=False)
     conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{TABLA_OUT} ON {TABLA_OUT}(curso_id, CAMPUS, MODALIDAD)")
     conn.commit()
-    print(f"Tabla SQLite creada: {TABLA_OUT}")
+    print(f"[{MODEL_TAG}] Tabla SQLite creada: {TABLA_OUT}")
 
     conn.close()
 
